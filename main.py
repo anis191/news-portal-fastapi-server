@@ -44,6 +44,17 @@ SQLModel.metadata.create_all(engine)
 # Initialize FastAPI
 app = FastAPI(title="News API (FastAPI + Supabase + Cloudinary)")
 
+# Add CORS Middleware
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Helper function for filtering
 def filter_news(items: List[News], category: Optional[str], search: Optional[str]):
     filtered = items
