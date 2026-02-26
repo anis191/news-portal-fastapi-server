@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Virtual env
+.dailyspot_env/
+venv/
+env/
+
+# dotenv
+.env
+
+# Pytest
+htmlcov/
+.tox/
+.coverage
+
+# IDEs
+.vscode/
+.idea/
