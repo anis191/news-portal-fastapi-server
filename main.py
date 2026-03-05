@@ -1,13 +1,14 @@
 from typing import Optional, List
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Body
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Body, Depends, Request
 from sqlmodel import SQLModel, Field, create_engine, Session, select
 from dotenv import load_dotenv
 import os
 import cloudinary
 import cloudinary.uploader
+from starlette.middleware.sessions import SessionMiddleware
 
-# environment variables
+# --- Load environment variables ---
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -15,17 +16,22 @@ CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
-# Connect to Supabase PostgreSQL
+# Admin credentials and session secret
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
+ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "change-me-in-prod")
+
+# --- Connect to Supabase PostgreSQL ---
 engine = create_engine(DATABASE_URL, echo=True)
 
-# Cloudinary Settings
+# --- Cloudinary Settings ---
 cloudinary.config(
     cloud_name=CLOUDINARY_CLOUD_NAME,
     api_key=CLOUDINARY_API_KEY,
     api_secret=CLOUDINARY_API_SECRET
 )
 
-# News model
+# --- News model ---
 class News(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     title: str
@@ -38,13 +44,14 @@ class News(SQLModel, table=True):
     source: Optional[str] = None
     categories: Optional[str] = None  # comma separated
 
-# Create table in Supabase
+# --- Create table in Supabase ---
 SQLModel.metadata.create_all(engine)
 
-# Initialize FastAPI
+# --- Initialize FastAPI ---
 app = FastAPI(title="News API (FastAPI + Supabase + Cloudinary)")
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("ADMIN_SECRET_KEY"))
 
-# Add CORS Middleware
+# --- CORS Middleware ---
 from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
@@ -55,7 +62,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Helper function for filtering
+# --- Helper function for filtering ---
 def filter_news(items: List[News], category: Optional[str], search: Optional[str]):
     filtered = items
     if search:
@@ -73,7 +80,13 @@ def filter_news(items: List[News], category: Optional[str], search: Optional[str
         ]
     return filtered
 
-# Endpoints
+# --- Admin dependency ---
+def admin_required(request: Request):
+    """Ensure admin is logged in via session"""
+    if not request.session.get("token") == "admin_logged_in":
+        raise HTTPException(status_code=403, detail="Admin privileges required")
+
+# --- News Endpoints ---
 @app.get("/news", response_model=List[News])
 def list_news(
     page: int = Query(1, ge=1),
@@ -97,7 +110,7 @@ def get_news(news_id: int):
         raise HTTPException(status_code=404, detail="News not found")
     return news
 
-@app.post("/news", response_model=News, status_code=201)
+@app.post("/news", response_model=News, status_code=201, dependencies=[Depends(admin_required)])
 async def create_news(
     title: str = Form(...),
     description: str = Form(...),
@@ -108,7 +121,7 @@ async def create_news(
     categories: str = Form(None),
     image: UploadFile = File(None)
 ):
-    """Create news with optional image upload, auto-published_at"""
+    """Create news with optional image upload, admin only"""
     image_url = None
     if image:
         result = cloudinary.uploader.upload(image.file, folder="news_images")
@@ -134,7 +147,7 @@ async def create_news(
     
     return news_item
 
-@app.put("/news/{news_id}", response_model=News)
+@app.put("/news/{news_id}", response_model=News, dependencies=[Depends(admin_required)])
 async def update_news(
     news_id: int,
     title: Optional[str] = Form(None),
@@ -146,13 +159,12 @@ async def update_news(
     categories: Optional[str] = Form(None),
     image: UploadFile = File(None)
 ):
-    """Update news fields and optionally replace image"""
+    """Update news fields and optionally replace image (admin only)"""
     with Session(engine) as session:
         news = session.get(News, news_id)
         if not news:
             raise HTTPException(status_code=404, detail="News not found")
         
-        # Update fields if provided
         if title: news.title = title
         if description: news.description = description
         if snippet: news.snippet = snippet
@@ -161,7 +173,6 @@ async def update_news(
         if source: news.source = source
         if categories: news.categories = categories
 
-        # Replace image if provided
         if image:
             result = cloudinary.uploader.upload(image.file, folder="news_images")
             news.imageUrl = result.get("secure_url")
@@ -172,9 +183,9 @@ async def update_news(
     
     return news
 
-@app.patch("/news/{news_id}", response_model=News)
+@app.patch("/news/{news_id}", response_model=News, dependencies=[Depends(admin_required)])
 async def patch_news(news_id: int, updated_data: dict = Body(...)):
-    """Update one or few fields of a news item"""
+    """Update one or few fields of a news item (admin only)"""
     with Session(engine) as session:
         news = session.get(News, news_id)
         if not news:
@@ -187,9 +198,9 @@ async def patch_news(news_id: int, updated_data: dict = Body(...)):
         session.refresh(news)
     return news
 
-@app.delete("/news/{news_id}", status_code=204)
+@app.delete("/news/{news_id}", status_code=204, dependencies=[Depends(admin_required)])
 def delete_news(news_id: int):
-    """Delete a news item by ID"""
+    """Delete a news item by ID (admin only)"""
     with Session(engine) as session:
         news = session.get(News, news_id)
         if not news:
@@ -197,3 +208,42 @@ def delete_news(news_id: int):
         session.delete(news)
         session.commit()
     return {"detail": "News deleted successfully"}
+
+# Admin Panel Setup:
+import asyncio
+from sqladmin import Admin, ModelView
+from sqladmin.authentication import AuthenticationBackend
+from starlette.requests import Request
+
+class AdminAuth(AuthenticationBackend):
+    def __init__(self, secret_key: str):
+        super().__init__(secret_key=secret_key)
+
+    async def login(self, request: Request) -> bool:
+        form = await request.form()
+        username = form.get("username")
+        password = form.get("password")
+        if username == ADMIN_USER and password == ADMIN_PASS:
+            request.session.update({"token": "admin_logged_in"})
+            return True
+        return False
+
+    async def logout(self, request: Request) -> bool:
+        request.session.clear()
+        return True
+
+    async def authenticate(self, request: Request) -> bool:
+        return bool(request.session.get("token"))
+
+# Initialize Admin
+auth_backend = AdminAuth(secret_key=ADMIN_SECRET_KEY)
+admin = Admin(app=app, engine=engine, authentication_backend=auth_backend, base_url="/admin")
+
+# Register News model in Admin
+class NewsAdmin(ModelView, model=News):
+    column_list = [News.id, News.title, News.published_at, News.source, News.language]
+    column_searchable_list = [News.title, News.description, News.snippet]
+    column_filters = []
+    form_excluded_columns = [News.id, News.published_at]
+
+admin.add_view(NewsAdmin)
