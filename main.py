@@ -96,7 +96,8 @@ def list_news(
 ):
     """List news with optional filtering by category or search, paginated"""
     with Session(engine) as session:
-        all_news = session.exec(select(News)).all()
+        # all_news = session.exec(select(News)).all()
+        all_news = session.exec(select(News).order_by(News.published_at.desc())).all()
     filtered = filter_news(all_news, category, search)
     start = (page - 1) * limit
     return filtered[start:start + limit]
