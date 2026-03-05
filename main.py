@@ -94,13 +94,29 @@ def list_news(
     category: Optional[str] = None,
     search: Optional[str] = None,
 ):
-    """List news with optional filtering by category or search, paginated"""
+    """List news sorted by newest first, with filtering and pagination optimized"""
     with Session(engine) as session:
-        # all_news = session.exec(select(News)).all()
-        all_news = session.exec(select(News).order_by(News.published_at.desc())).all()
-    filtered = filter_news(all_news, category, search)
-    start = (page - 1) * limit
-    return filtered[start:start + limit]
+        query = select(News).order_by(News.published_at.desc())
+
+        # Filter by category (if provided)
+        if category:
+            query = query.where(News.categories.ilike(f"%{category}%"))
+
+        # Filter by search (if provided)
+        if search:
+            q = f"%{search}%"
+            query = query.where(
+                (News.title.ilike(q)) |
+                (News.description.ilike(q)) |
+                (News.snippet.ilike(q))
+            )
+
+        # Pagination
+        all_news = session.exec(
+            query.offset((page - 1) * limit).limit(limit)
+        ).all()
+
+    return all_news
 
 @app.get("/news/{news_id}", response_model=News)
 def get_news(news_id: int):
