@@ -9,15 +9,16 @@ import os
 import cloudinary
 import cloudinary.uploader
 from starlette.middleware.sessions import SessionMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+from sqladmin import Admin, ModelView
+from sqladmin.authentication import AuthenticationBackend
 
 # --- Load environment variables ---
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
-
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "change-me-in-prod")
@@ -32,7 +33,7 @@ cloudinary.config(
     api_secret=CLOUDINARY_API_SECRET
 )
 
-# --- News model ---
+# --- News Model ---
 class News(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     title: str
@@ -46,21 +47,17 @@ class News(SQLModel, table=True):
     categories: Optional[str] = None
     is_featured: bool = Field(default=False)
 
-# --- SQLAlchemy event listener: enforce only one featured news at a time ---
-# This fires on ANY write — FastAPI endpoints AND sqladmin panel
+
+# --- SQLAlchemy Event Listener ---
+# Enforces only one featured news at a time.
+# Fires on ANY write — FastAPI endpoints AND sqladmin panel.
 @event.listens_for(SASession, "before_flush")
 def enforce_single_featured(session, flush_context, instances):
-    """
-    Before any DB flush, if a News item is being set to is_featured=True,
-    automatically set all other News items to is_featured=False.
-    Covers sqladmin, FastAPI endpoints, and any direct DB write.
-    """
     for obj in list(session.new) + list(session.dirty):
         if not isinstance(obj, News):
             continue
         if not obj.is_featured:
             continue
-        # This object is being featured — unfeature all others in DB
         already_featured = session.execute(
             select(News).where(News.is_featured == True)
         ).scalars().all()
@@ -69,16 +66,15 @@ def enforce_single_featured(session, flush_context, instances):
                 other.is_featured = False
                 session.add(other)
 
-# --- Create tables ---
+
+# --- Create Tables ---
 SQLModel.metadata.create_all(engine)
 
 # --- Initialize FastAPI ---
 app = FastAPI(title="News API (FastAPI + Supabase + Cloudinary)")
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("ADMIN_SECRET_KEY"))
 
-# --- CORS Middleware ---
-from fastapi.middleware.cors import CORSMiddleware
-
+# --- Middlewares ---
+app.add_middleware(SessionMiddleware, secret_key=ADMIN_SECRET_KEY)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -87,13 +83,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Admin dependency ---
+# --- Admin Dependency ---
 def admin_required(request: Request):
-    """Ensure admin is logged in via session"""
     if not request.session.get("token") == "admin_logged_in":
         raise HTTPException(status_code=403, detail="Admin privileges required")
 
-# --- News Endpoints ---
+
+# ===========================================================================
+# NEWS ENDPOINTS
+# IMPORTANT: Fixed-path routes (/news/featured/current) MUST be registered
+# BEFORE dynamic-path routes (/news/{news_id}) to avoid routing conflicts.
+# ===========================================================================
 
 @app.get("/news", response_model=List[News])
 def list_news(
@@ -102,7 +102,7 @@ def list_news(
     category: Optional[str] = None,
     search: Optional[str] = None,
 ):
-    """List news sorted by newest first, with filtering and pagination"""
+    """List news sorted by newest first, with optional filtering and pagination"""
     with Session(engine) as session:
         query = select(News).order_by(News.published_at.desc())
 
@@ -124,9 +124,10 @@ def list_news(
     return all_news
 
 
+# ✅ FIXED PATH — must be registered BEFORE /news/{news_id}
 @app.get("/news/featured/current", response_model=Optional[News])
 def get_featured_news():
-    """Get the currently featured news item"""
+    """Get the currently featured news item (is_featured=True)"""
     with Session(engine) as session:
         news = session.exec(
             select(News).where(News.is_featured == True)
@@ -134,6 +135,7 @@ def get_featured_news():
     return news
 
 
+# ✅ DYNAMIC PATH — must always come AFTER all fixed /news/* routes
 @app.get("/news/{news_id}", response_model=News)
 def get_news(news_id: int):
     """Get a single news item by ID"""
@@ -156,7 +158,7 @@ async def create_news(
     is_featured: bool = Form(False),
     image: UploadFile = File(None)
 ):
-    """Create news with optional image upload (admin only)"""
+    """Create a news item with optional image upload (admin only)"""
     image_url = None
     if image:
         result = cloudinary.uploader.upload(image.file, folder="news_images")
@@ -196,21 +198,20 @@ async def update_news(
     is_featured: Optional[bool] = Form(None),
     image: UploadFile = File(None)
 ):
-    """Update news fields and optionally replace image (admin only)"""
+    """Update a news item and optionally replace its image (admin only)"""
     with Session(engine) as session:
         news = session.get(News, news_id)
         if not news:
             raise HTTPException(status_code=404, detail="News not found")
 
-        if title:           news.title = title
-        if description:     news.description = description
-        if snippet:         news.snippet = snippet
-        if url:             news.url = url
-        if language:        news.language = language
-        if source:          news.source = source
-        if categories:      news.categories = categories
-        if is_featured is not None:
-            news.is_featured = is_featured
+        if title:                       news.title = title
+        if description:                 news.description = description
+        if snippet:                     news.snippet = snippet
+        if url:                         news.url = url
+        if language:                    news.language = language
+        if source:                      news.source = source
+        if categories:                  news.categories = categories
+        if is_featured is not None:     news.is_featured = is_featured
 
         if image:
             result = cloudinary.uploader.upload(image.file, folder="news_images")
@@ -225,7 +226,7 @@ async def update_news(
 
 @app.patch("/news/{news_id}", response_model=News, dependencies=[Depends(admin_required)])
 async def patch_news(news_id: int, updated_data: dict = Body(...)):
-    """Update one or few fields of a news item (admin only)"""
+    """Partially update a news item (admin only)"""
     with Session(engine) as session:
         news = session.get(News, news_id)
         if not news:
@@ -254,9 +255,9 @@ def delete_news(news_id: int):
     return {"detail": "News deleted successfully"}
 
 
-# --- Admin Panel ---
-from sqladmin import Admin, ModelView
-from sqladmin.authentication import AuthenticationBackend
+# ===========================================================================
+# ADMIN PANEL
+# ===========================================================================
 
 class AdminAuth(AuthenticationBackend):
     def __init__(self, secret_key: str):
