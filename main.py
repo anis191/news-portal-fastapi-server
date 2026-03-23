@@ -2,6 +2,8 @@ from typing import Optional, List
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form, Body, Depends, Request
 from sqlmodel import SQLModel, Field, create_engine, Session, select
+from sqlalchemy import event
+from sqlalchemy.orm import Session as SASession
 from dotenv import load_dotenv
 import os
 import cloudinary
@@ -16,7 +18,6 @@ CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
 CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
 CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 
-# Admin credentials and session secret
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
 ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "change-me-in-prod")
@@ -42,9 +43,33 @@ class News(SQLModel, table=True):
     language: Optional[str] = "en"
     published_at: Optional[datetime] = None
     source: Optional[str] = None
-    categories: Optional[str] = None  # comma separated
+    categories: Optional[str] = None
+    is_featured: bool = Field(default=False)
 
-# --- Create table in Supabase ---
+# --- SQLAlchemy event listener: enforce only one featured news at a time ---
+# This fires on ANY write — FastAPI endpoints AND sqladmin panel
+@event.listens_for(SASession, "before_flush")
+def enforce_single_featured(session, flush_context, instances):
+    """
+    Before any DB flush, if a News item is being set to is_featured=True,
+    automatically set all other News items to is_featured=False.
+    Covers sqladmin, FastAPI endpoints, and any direct DB write.
+    """
+    for obj in list(session.new) + list(session.dirty):
+        if not isinstance(obj, News):
+            continue
+        if not obj.is_featured:
+            continue
+        # This object is being featured — unfeature all others in DB
+        already_featured = session.execute(
+            select(News).where(News.is_featured == True)
+        ).scalars().all()
+        for other in already_featured:
+            if other.id != obj.id:
+                other.is_featured = False
+                session.add(other)
+
+# --- Create tables ---
 SQLModel.metadata.create_all(engine)
 
 # --- Initialize FastAPI ---
@@ -62,24 +87,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper function for filtering ---
-def filter_news(items: List[News], category: Optional[str], search: Optional[str]):
-    filtered = items
-    if search:
-        q = search.lower()
-        filtered = [
-            n for n in filtered
-            if (n.title and q in n.title.lower()) or
-               (n.description and q in n.description.lower()) or
-               (n.snippet and q in n.snippet.lower())
-        ]
-    if category:
-        filtered = [
-            n for n in filtered
-            if n.categories and category.lower() in n.categories.lower()
-        ]
-    return filtered
-
 # --- Admin dependency ---
 def admin_required(request: Request):
     """Ensure admin is logged in via session"""
@@ -87,6 +94,7 @@ def admin_required(request: Request):
         raise HTTPException(status_code=403, detail="Admin privileges required")
 
 # --- News Endpoints ---
+
 @app.get("/news", response_model=List[News])
 def list_news(
     page: int = Query(1, ge=1),
@@ -94,15 +102,13 @@ def list_news(
     category: Optional[str] = None,
     search: Optional[str] = None,
 ):
-    """List news sorted by newest first, with filtering and pagination optimized"""
+    """List news sorted by newest first, with filtering and pagination"""
     with Session(engine) as session:
         query = select(News).order_by(News.published_at.desc())
 
-        # Filter by category (if provided)
         if category:
             query = query.where(News.categories.ilike(f"%{category}%"))
 
-        # Filter by search (if provided)
         if search:
             q = f"%{search}%"
             query = query.where(
@@ -111,12 +117,22 @@ def list_news(
                 (News.snippet.ilike(q))
             )
 
-        # Pagination
         all_news = session.exec(
             query.offset((page - 1) * limit).limit(limit)
         ).all()
 
     return all_news
+
+
+@app.get("/news/featured/current", response_model=Optional[News])
+def get_featured_news():
+    """Get the currently featured news item"""
+    with Session(engine) as session:
+        news = session.exec(
+            select(News).where(News.is_featured == True)
+        ).first()
+    return news
+
 
 @app.get("/news/{news_id}", response_model=News)
 def get_news(news_id: int):
@@ -127,6 +143,7 @@ def get_news(news_id: int):
         raise HTTPException(status_code=404, detail="News not found")
     return news
 
+
 @app.post("/news", response_model=News, status_code=201, dependencies=[Depends(admin_required)])
 async def create_news(
     title: str = Form(...),
@@ -136,15 +153,15 @@ async def create_news(
     language: str = Form("en"),
     source: str = Form(None),
     categories: str = Form(None),
+    is_featured: bool = Form(False),
     image: UploadFile = File(None)
 ):
-    """Create news with optional image upload, admin only"""
+    """Create news with optional image upload (admin only)"""
     image_url = None
     if image:
         result = cloudinary.uploader.upload(image.file, folder="news_images")
         image_url = result.get("secure_url")
-    
-    published_at_dt = datetime.utcnow()
+
     news_item = News(
         title=title,
         description=description,
@@ -152,17 +169,19 @@ async def create_news(
         url=url,
         imageUrl=image_url,
         language=language,
-        published_at=published_at_dt,
+        published_at=datetime.utcnow(),
         source=source,
-        categories=categories
+        categories=categories,
+        is_featured=is_featured
     )
 
     with Session(engine) as session:
         session.add(news_item)
         session.commit()
         session.refresh(news_item)
-    
+
     return news_item
+
 
 @app.put("/news/{news_id}", response_model=News, dependencies=[Depends(admin_required)])
 async def update_news(
@@ -174,6 +193,7 @@ async def update_news(
     language: Optional[str] = Form(None),
     source: Optional[str] = Form(None),
     categories: Optional[str] = Form(None),
+    is_featured: Optional[bool] = Form(None),
     image: UploadFile = File(None)
 ):
     """Update news fields and optionally replace image (admin only)"""
@@ -181,24 +201,27 @@ async def update_news(
         news = session.get(News, news_id)
         if not news:
             raise HTTPException(status_code=404, detail="News not found")
-        
-        if title: news.title = title
-        if description: news.description = description
-        if snippet: news.snippet = snippet
-        if url: news.url = url
-        if language: news.language = language
-        if source: news.source = source
-        if categories: news.categories = categories
+
+        if title:           news.title = title
+        if description:     news.description = description
+        if snippet:         news.snippet = snippet
+        if url:             news.url = url
+        if language:        news.language = language
+        if source:          news.source = source
+        if categories:      news.categories = categories
+        if is_featured is not None:
+            news.is_featured = is_featured
 
         if image:
             result = cloudinary.uploader.upload(image.file, folder="news_images")
             news.imageUrl = result.get("secure_url")
-        
+
         session.add(news)
         session.commit()
         session.refresh(news)
-    
+
     return news
+
 
 @app.patch("/news/{news_id}", response_model=News, dependencies=[Depends(admin_required)])
 async def patch_news(news_id: int, updated_data: dict = Body(...)):
@@ -207,13 +230,17 @@ async def patch_news(news_id: int, updated_data: dict = Body(...)):
         news = session.get(News, news_id)
         if not news:
             raise HTTPException(status_code=404, detail="News not found")
+
         for key, value in updated_data.items():
             if hasattr(news, key):
                 setattr(news, key, value)
+
         session.add(news)
         session.commit()
         session.refresh(news)
+
     return news
+
 
 @app.delete("/news/{news_id}", status_code=204, dependencies=[Depends(admin_required)])
 def delete_news(news_id: int):
@@ -226,11 +253,10 @@ def delete_news(news_id: int):
         session.commit()
     return {"detail": "News deleted successfully"}
 
-# Admin Panel Setup:
-import asyncio
+
+# --- Admin Panel ---
 from sqladmin import Admin, ModelView
 from sqladmin.authentication import AuthenticationBackend
-from starlette.requests import Request
 
 class AdminAuth(AuthenticationBackend):
     def __init__(self, secret_key: str):
@@ -252,15 +278,16 @@ class AdminAuth(AuthenticationBackend):
     async def authenticate(self, request: Request) -> bool:
         return bool(request.session.get("token"))
 
-# Initialize Admin
+
 auth_backend = AdminAuth(secret_key=ADMIN_SECRET_KEY)
 admin = Admin(app=app, engine=engine, authentication_backend=auth_backend, base_url="/admin")
 
-# Register News model in Admin
+
 class NewsAdmin(ModelView, model=News):
-    column_list = [News.id, News.title, News.published_at, News.source, News.language]
+    column_list = [News.id, News.title, News.published_at, News.source, News.language, News.is_featured]
     column_searchable_list = [News.title, News.description, News.snippet]
     column_filters = []
     form_excluded_columns = [News.id, News.published_at]
+
 
 admin.add_view(NewsAdmin)
